@@ -1,1 +1,1 @@
-# rar-feed-importer
+# RAR Feed Importer
