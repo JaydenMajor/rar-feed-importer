@@ -18,9 +18,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 define( 'RARFI_VERSION', '1.0.0' );
 define( 'RARFI_OPTION', 'rarfi_settings' );
 define( 'RARFI_LOG_OPTION', 'rarfi_last_run' );
+define( 'RARFI_LOCK', 'rarfi_running' );
 define( 'RARFI_CRON_HOOK', 'rarfi_daily_import' );
 define( 'RARFI_META_GUID', '_rarfi_guid' );
 define( 'RARFI_META_SOURCE', '_rarfi_source_url' );
+define( 'RARFI_META_IMAGE', '_rarfi_source_image' );
 
 /**
  * Default settings.
@@ -31,11 +33,11 @@ function rarfi_defaults() {
 	return array(
 		'feed_url'        => 'https://rarnational.org.au/feed',
 		'post_type'       => 'post',
-		'post_status'     => 'draft',
+		'post_status'     => 'publish',
 		'post_author'     => 1,
 		'category'        => 0,
 		'max_items'       => 20,
-		'max_age_days'    => 0,
+		'max_age_days'    => 30,
 		'import_images'   => 1,
 		'import_terms'    => 0,
 		'backdate'        => 1,
@@ -118,9 +120,15 @@ function rarfi_import( $trigger = 'cron' ) {
 
 	if ( empty( $settings['feed_url'] ) ) {
 		$result['errors'][] = __( 'No feed URL configured.', 'rar-feed-importer' );
-		update_option( RARFI_LOG_OPTION, $result, false );
+		return rarfi_finish( $result );
+	}
+
+	// Stop a manual click or an external trigger colliding with a run already in flight.
+	if ( get_transient( RARFI_LOCK ) ) {
+		$result['errors'][] = __( 'Another import is already running.', 'rar-feed-importer' );
 		return $result;
 	}
+	set_transient( RARFI_LOCK, 1, 10 * MINUTE_IN_SECONDS );
 
 	if ( ! function_exists( 'fetch_feed' ) ) {
 		include_once ABSPATH . WPINC . '/feed.php';
@@ -133,8 +141,7 @@ function rarfi_import( $trigger = 'cron' ) {
 
 	if ( is_wp_error( $feed ) ) {
 		$result['errors'][] = $feed->get_error_message();
-		update_option( RARFI_LOG_OPTION, $result, false );
-		return $result;
+		return rarfi_finish( $result );
 	}
 
 	$max   = max( 1, (int) $settings['max_items'] );
@@ -142,8 +149,7 @@ function rarfi_import( $trigger = 'cron' ) {
 
 	if ( empty( $items ) ) {
 		$result['errors'][] = __( 'Feed returned no items.', 'rar-feed-importer' );
-		update_option( RARFI_LOG_OPTION, $result, false );
-		return $result;
+		return rarfi_finish( $result );
 	}
 
 	$cutoff = 0;
@@ -176,6 +182,17 @@ function rarfi_import( $trigger = 'cron' ) {
 		$result['titles'][] = get_the_title( $post_id );
 	}
 
+	return rarfi_finish( $result );
+}
+
+/**
+ * Write the run log, release the lock and hand back the result.
+ *
+ * @param array $result
+ * @return array
+ */
+function rarfi_finish( $result ) {
+	delete_transient( RARFI_LOCK );
 	update_option( RARFI_LOG_OPTION, $result, false );
 
 	/**
@@ -256,7 +273,7 @@ function rarfi_create_post( $item, $guid, $settings ) {
 		'post_title'   => $title,
 		'post_content' => wp_kses_post( (string) $content ),
 		'post_excerpt' => wp_kses_post( wp_strip_all_tags( (string) $item->get_description() ) ),
-		'post_status'  => $settings['post_status'],
+		'post_status'  => 'draft',
 		'post_type'    => $settings['post_type'],
 		'post_author'  => (int) $settings['post_author'],
 	);
@@ -290,6 +307,17 @@ function rarfi_create_post( $item, $guid, $settings ) {
 		rarfi_attach_featured_image( $post_id, $item );
 	}
 
+	// Everything is attached, so publishing now fires the draft-to-publish
+	// transition with the featured image already in place.
+	if ( 'draft' !== $settings['post_status'] ) {
+		wp_update_post(
+			array(
+				'ID'          => $post_id,
+				'post_status' => $settings['post_status'],
+			)
+		);
+	}
+
 	return $post_id;
 }
 
@@ -319,8 +347,72 @@ function rarfi_assign_terms( $post_id, $item ) {
 }
 
 /**
- * Sideload a featured image: the enclosure if there is one, otherwise the
- * first <img> found in the item content.
+ * Find the best candidate image URL for a feed item.
+ *
+ * Checks, in order: the enclosure, media:thumbnail, media:content, then the
+ * first <img> in the item content.
+ *
+ * @param SimplePie_Item $item
+ * @return string
+ */
+function rarfi_find_image_url( $item ) {
+	$enclosure = $item->get_enclosure();
+
+	if ( $enclosure ) {
+		$link = $enclosure->get_link();
+		$type = (string) $enclosure->get_type();
+
+		if ( $link && ( 0 === strpos( $type, 'image/' ) || rarfi_looks_like_image( $link ) ) ) {
+			return $link;
+		}
+
+		$thumb = $enclosure->get_thumbnail();
+		if ( ! empty( $thumb ) ) {
+			return is_array( $thumb ) ? reset( $thumb ) : $thumb;
+		}
+	}
+
+	// media:thumbnail / media:content, which most WordPress SEO plugins add.
+	foreach ( array( 'thumbnail', 'content' ) as $tag ) {
+		$nodes = $item->get_item_tags( 'http://search.yahoo.com/mrss/', $tag );
+		if ( ! empty( $nodes[0]['attribs']['']['url'] ) ) {
+			return $nodes[0]['attribs']['']['url'];
+		}
+	}
+
+	$content = $item->get_content();
+	if ( $content && preg_match( '/<img[^>]+src=["\']([^"\']+)["\']/i', $content, $matches ) ) {
+		return $matches[1];
+	}
+
+	return '';
+}
+
+function rarfi_looks_like_image( $url ) {
+	return (bool) preg_match( '/\.(jpe?g|png|gif|webp)(\?|$)/i', $url );
+}
+
+/**
+ * Return an existing attachment previously sideloaded from this URL, if any,
+ * so a repeated image in the feed does not fill the media library with copies.
+ *
+ * @param string $url
+ * @return int
+ */
+function rarfi_existing_attachment( $url ) {
+	global $wpdb;
+
+	return (int) $wpdb->get_var(
+		$wpdb->prepare(
+			"SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %s LIMIT 1",
+			RARFI_META_IMAGE,
+			$url
+		)
+	);
+}
+
+/**
+ * Sideload a featured image for the post.
  *
  * @param int            $post_id
  * @param SimplePie_Item $item
@@ -330,25 +422,17 @@ function rarfi_attach_featured_image( $post_id, $item ) {
 		return;
 	}
 
-	$url = '';
-
-	$enclosure = $item->get_enclosure();
-	if ( $enclosure ) {
-		$link = $enclosure->get_link();
-		$type = (string) $enclosure->get_type();
-		if ( $link && ( 0 === strpos( $type, 'image/' ) || preg_match( '/\.(jpe?g|png|gif|webp)(\?|$)/i', $link ) ) ) {
-			$url = $link;
-		}
-	}
-
-	if ( ! $url ) {
-		$content = $item->get_content();
-		if ( $content && preg_match( '/<img[^>]+src=["\']([^"\']+)["\']/i', $content, $matches ) ) {
-			$url = $matches[1];
-		}
-	}
+	$url = rarfi_find_image_url( $item );
 
 	if ( ! $url || ! preg_match( '#^https?://#i', $url ) ) {
+		return;
+	}
+
+	$url = esc_url_raw( $url );
+
+	$existing = rarfi_existing_attachment( $url );
+	if ( $existing ) {
+		set_post_thumbnail( $post_id, $existing );
 		return;
 	}
 
@@ -356,7 +440,7 @@ function rarfi_attach_featured_image( $post_id, $item ) {
 	require_once ABSPATH . 'wp-admin/includes/media.php';
 	require_once ABSPATH . 'wp-admin/includes/image.php';
 
-	$tmp = download_url( esc_url_raw( $url ), 30 );
+	$tmp = download_url( $url, 30 );
 	if ( is_wp_error( $tmp ) ) {
 		return;
 	}
@@ -380,6 +464,7 @@ function rarfi_attach_featured_image( $post_id, $item ) {
 		return;
 	}
 
+	update_post_meta( $attachment_id, RARFI_META_IMAGE, $url );
 	set_post_thumbnail( $post_id, $attachment_id );
 }
 
@@ -423,11 +508,11 @@ function rarfi_sanitize_settings( $input ) {
 
 	$out['feed_url']      = esc_url_raw( trim( (string) ( $input['feed_url'] ?? $defaults['feed_url'] ) ) );
 	$out['post_type']     = sanitize_key( $input['post_type'] ?? 'post' );
-	$out['post_status']   = in_array( $input['post_status'] ?? '', array( 'draft', 'publish', 'pending', 'private' ), true ) ? $input['post_status'] : 'draft';
+	$out['post_status']   = in_array( $input['post_status'] ?? '', array( 'draft', 'publish', 'pending', 'private' ), true ) ? $input['post_status'] : $defaults['post_status'];
 	$out['post_author']   = max( 1, (int) ( $input['post_author'] ?? 1 ) );
 	$out['category']      = max( 0, (int) ( $input['category'] ?? 0 ) );
-	$out['max_items']     = min( 100, max( 1, (int) ( $input['max_items'] ?? 20 ) ) );
-	$out['max_age_days']  = max( 0, (int) ( $input['max_age_days'] ?? 0 ) );
+	$out['max_items']     = min( 100, max( 1, (int) ( $input['max_items'] ?? $defaults['max_items'] ) ) );
+	$out['max_age_days']  = max( 0, (int) ( $input['max_age_days'] ?? $defaults['max_age_days'] ) );
 	$out['import_images'] = empty( $input['import_images'] ) ? 0 : 1;
 	$out['import_terms']  = empty( $input['import_terms'] ) ? 0 : 1;
 	$out['backdate']      = empty( $input['backdate'] ) ? 0 : 1;
@@ -528,7 +613,7 @@ function rarfi_settings_page() {
 								</option>
 							<?php endforeach; ?>
 						</select>
-						<p class="description"><?php esc_html_e( 'Draft is the safe default until you have seen a run or two.', 'rar-feed-importer' ); ?></p>
+						<p class="description"><?php esc_html_e( 'Imported items go live immediately. Switch to Draft if you would rather review them first.', 'rar-feed-importer' ); ?></p>
 					</td>
 				</tr>
 				<tr>
@@ -664,3 +749,9 @@ function rarfi_settings_page() {
 	</div>
 	<?php
 }
+
+// Plugin Updater
+require 'plugin-update-checker/plugin-update-checker.php';
+use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
+$myUpdateChecker = PucFactory::buildUpdateChecker('https://github.com/JaydenMajor/rar-feed-importer',__FILE__,'rar-feed-importer');
+$myUpdateChecker->setBranch('main');
